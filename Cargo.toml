@@ -1,0 +1,23 @@
+[package]
+name = "ccs-proxy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Local HTTP and WebSocket relay for Codex remote-control traffic."
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+serde_json = "1"
+tower = "0.5"
