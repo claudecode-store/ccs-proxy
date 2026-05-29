@@ -26,6 +26,8 @@ http://localhost:8000
 
 每次发布版本都会在 GitHub Releases 里提供 6 个二进制包：
 
+[https://github.com/claudecode-store/ccs-proxy/releases](https://github.com/claudecode-store/ccs-proxy/releases)
+
 | 系统 | 架构 | 文件 |
 | --- | --- | --- |
 | Linux | amd64 | `ccs-proxy-linux-amd64.tar.gz` |
