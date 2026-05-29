@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-24.04
+            binary: ccs-proxy
+            archive: ccs-proxy-linux-amd64.tar.gz
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            binary: ccs-proxy
+            archive: ccs-proxy-linux-arm64.tar.gz
+          - target: macos-amd64
+            os: macos-15-intel
+            binary: ccs-proxy
+            archive: ccs-proxy-macos-amd64.tar.gz
+          - target: macos-arm64
+            os: macos-15
+            binary: ccs-proxy
+            archive: ccs-proxy-macos-arm64.tar.gz
+          - target: windows-amd64
+            os: windows-2022
+            binary: ccs-proxy.exe
+            archive: ccs-proxy-windows-amd64.zip
+          - target: windows-arm64
+            os: windows-11-arm
+            binary: ccs-proxy.exe
+            archive: ccs-proxy-windows-arm64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary }}" "dist/ccs-proxy"
+          chmod +x "dist/ccs-proxy"
+          tar -C dist -czf "${{ matrix.archive }}" ccs-proxy
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "dist/ccs-proxy.exe"
+          Compress-Archive -Path "dist/ccs-proxy.exe" -DestinationPath "${{ matrix.archive }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          mapfile -t assets < <(find release-assets -type f | sort)
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were downloaded." >&2
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG_NAME" \
+              --notes "Automated release for $TAG_NAME." \
+              --verify-tag
+          fi

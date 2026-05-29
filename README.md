@@ -1,166 +1,179 @@
 # ccs-proxy
 
-`ccs-proxy` is a local HTTP and WebSocket relay for Codex remote-control traffic.
+`ccs-proxy` 是一个本地转发工具。
 
-Codex App allows remote-control connections to `localhost`, so this proxy lets Codex App talk to a local address while forwarding traffic to a configurable upstream proxy.
+简单说：Codex App 只能稳定地把登录信息带到 `http://localhost:8000`，但你真正要访问的服务可能在别的地址。这个工具就在中间转一下，把 Codex App 发到本机的 HTTP 和 WebSocket 请求，转发到你配置的上游服务。
 
-Use `http://localhost:8000` in Codex App configuration. Do not use `127.0.0.1` or another port for Codex App URLs unless you know the App version you are using still attaches ChatGPT authentication headers for that host. Current Codex App builds only auto-attach those headers for a small allowlist that includes `localhost:8000`.
+## 什么时候需要它
 
-## Build
+你需要让 Codex App 访问一个自定义的 ChatGPT/Codex 上游服务时，可以用它。
 
-Debug build:
+推荐在 Codex App 里使用：
+
+```text
+http://localhost:8000
+```
+
+不要随便改成 `127.0.0.1` 或其他端口。部分 Codex App 版本只会给 `localhost:8000` 自动带上 ChatGPT 登录头，换掉后可能出现上游返回 `401`、`403` 或连接失败。
+
+## 下载
+
+每次发布版本都会在 GitHub Releases 里提供 6 个二进制包：
+
+| 系统 | 架构 | 文件 |
+| --- | --- | --- |
+| Linux | amd64 | `ccs-proxy-linux-amd64.tar.gz` |
+| Linux | arm64 | `ccs-proxy-linux-arm64.tar.gz` |
+| macOS | amd64 | `ccs-proxy-macos-amd64.tar.gz` |
+| macOS | arm64 | `ccs-proxy-macos-arm64.tar.gz` |
+| Windows | amd64 | `ccs-proxy-windows-amd64.zip` |
+| Windows | arm64 | `ccs-proxy-windows-arm64.zip` |
+
+下载后解压，把 `ccs-proxy` 或 `ccs-proxy.exe` 放到你习惯的位置即可。
+
+## 自己编译
+
+需要先安装 Rust。
+
+开发构建：
 
 ```bash
 cargo build
 ```
 
-Release build:
+正式构建：
 
 ```bash
 cargo build --release
 ```
 
-The compiled binary is:
+编译后的文件在：
 
-- macOS/Linux: `target/release/ccs-proxy`
-- Windows: `target\release\ccs-proxy.exe`
+- macOS/Linux：`target/release/ccs-proxy`
+- Windows：`target\release\ccs-proxy.exe`
 
-## Install
+也可以直接安装到本机 Cargo bin 目录：
 
 ```bash
 cargo install --path .
 ```
 
-## Run
+## 启动
 
-Default upstream:
+直接启动会使用默认上游：
 
 ```bash
 ccs-proxy
 ```
 
-Custom upstream:
+指定上游地址：
 
 ```bash
 CCS_PROXY_UPSTREAM_BASE_URL=https://your-proxy.example ccs-proxy
 ```
 
-Windows PowerShell:
+Windows PowerShell：
 
 ```powershell
 $env:CCS_PROXY_UPSTREAM_BASE_URL = "https://your-proxy.example"
 .\ccs-proxy.exe
 ```
 
-## Configuration
+## 配置项
 
-Environment variables and CLI flags are both supported. CLI flags take precedence.
+环境变量和命令行参数都支持。两者同时存在时，命令行参数优先。
 
-| Environment variable | CLI flag | Default |
-| --- | --- | --- |
-| `CCS_PROXY_LISTEN` | `--listen` | `127.0.0.1:8000` |
-| `CCS_PROXY_UPSTREAM_BASE_URL` | `--upstream-base-url` | `https://chatgpt.claudecode.store` |
-| `CCS_PROXY_UPSTREAM_PREFIX` | `--upstream-prefix` | empty |
-| `RUST_LOG` | n/a | `info` |
+| 环境变量 | 命令行参数 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `CCS_PROXY_LISTEN` | `--listen` | `127.0.0.1:8000` | 本地监听地址 |
+| `CCS_PROXY_UPSTREAM_BASE_URL` | `--upstream-base-url` | `https://chatgpt.claudecode.store` | 上游服务地址 |
+| `CCS_PROXY_UPSTREAM_PREFIX` | `--upstream-prefix` | 空 | 转发前自动加上的路径前缀 |
+| `RUST_LOG` | 无 | `info` | 日志级别 |
 
-## Path Mapping
-
-`ccs-proxy` builds the upstream URL like this:
-
-```text
-{CCS_PROXY_UPSTREAM_BASE_URL}{CCS_PROXY_UPSTREAM_PREFIX}{incoming request path and query}
-```
-
-For Codex remote-control compatibility, this one path shape is normalized before forwarding:
-
-```text
-.../backend-api/codex/wham/remote/control/*
--> .../backend-api/wham/remote/control/*
-```
-
-Codex App can produce the first form when `chatgpt_base_url` ends in `/backend-api/codex` and the UI requests `/wham/remote/control/*`. Many upstream proxies expose the remote-control server under `/backend-api/wham/remote/control/*`.
-
-`CCS_PROXY_UPSTREAM_PREFIX` is optional. It is useful when your upstream service requires a fixed Codex backend base path, but you do not want to repeat that path in every Codex local URL.
-
-This prefix is for routing only. Do not put a user id in the path just to identify the authenticated user. Codex App sends authentication headers to the local proxy, and `ccs-proxy` forwards end-to-end headers such as `Authorization` to the upstream service.
-
-Authentication and routing are intentionally separate:
-
-- Authentication comes from the `Authorization` header sent by Codex App.
-- Routing comes from the request path plus the optional `CCS_PROXY_UPSTREAM_PREFIX`.
-- `ccs-proxy` does not require, parse, or inject a user id in the URL path.
-
-Choose one of these two styles.
-
-### Style 1: Full Path In Codex Config
-
-Leave `CCS_PROXY_UPSTREAM_PREFIX` empty:
+示例：
 
 ```bash
-CCS_PROXY_UPSTREAM_BASE_URL=https://your-proxy.example ccs-proxy
+ccs-proxy \
+  --listen 127.0.0.1:8000 \
+  --upstream-base-url https://your-proxy.example \
+  --upstream-prefix /your-route/backend-api
 ```
 
-Then put the full upstream Codex backend path in Codex config, but replace the upstream host with `localhost:8000`:
+## 路径怎么转发
 
-```toml
-chatgpt_base_url = "http://localhost:8000/<upstream-codex-base-path>"
-```
-
-Forwarding example:
+转发规则很直接：
 
 ```text
-http://localhost:8000/<upstream-codex-base-path>/wham/remote/control/server
--> https://your-proxy.example/<upstream-codex-base-path>/wham/remote/control/server
+上游地址 + 可选前缀 + Codex App 请求的原始路径和查询参数
 ```
 
-### Style 2: Fixed Path In `CCS_PROXY_UPSTREAM_PREFIX`
-
-Put the fixed upstream Codex backend path in `CCS_PROXY_UPSTREAM_PREFIX`:
-
-```bash
-CCS_PROXY_UPSTREAM_BASE_URL=https://your-proxy.example \
-CCS_PROXY_UPSTREAM_PREFIX=/<upstream-codex-base-path> \
-ccs-proxy
-```
-
-Then Codex config can use only the local proxy origin:
-
-```toml
-chatgpt_base_url = "http://localhost:8000"
-```
-
-Forwarding example:
+例如：
 
 ```text
 http://localhost:8000/wham/remote/control/server
--> https://your-proxy.example/<upstream-codex-base-path>/wham/remote/control/server
+-> https://your-proxy.example/your-route/backend-api/wham/remote/control/server
 ```
 
-Do not use both styles at the same time. If you put the full path in Codex config and also set `CCS_PROXY_UPSTREAM_PREFIX`, the path will be duplicated.
+`ccs-proxy` 不会猜测、改写业务路径。如果 Codex App 请求的是 `/backend-api/codex/beacons/home`，上游收到的也是这个路径。路径是否正确，应由你的上游服务或 Codex 配置决定。
 
-## Codex App
+## Codex App 怎么配
 
-Use a local URL in `~/.codex/config.toml`. The path, if present, must be the Codex backend base path required by your upstream service:
+推荐方式是把上游固定前缀放到 `CCS_PROXY_UPSTREAM_PREFIX`，然后 Codex App 只配本地地址。
 
-```toml
-chatgpt_base_url = "http://localhost:8000/<upstream-codex-base-path>"
+启动代理：
+
+```bash
+CCS_PROXY_UPSTREAM_BASE_URL=https://your-proxy.example \
+CCS_PROXY_UPSTREAM_PREFIX=/your-route/backend-api \
+ccs-proxy
 ```
 
-If you set `CCS_PROXY_UPSTREAM_PREFIX`, use this instead:
+然后在 `~/.codex/config.toml` 中配置：
 
 ```toml
 chatgpt_base_url = "http://localhost:8000"
 ```
 
-Do not copy placeholders literally. `ccs-proxy` only relays traffic; it does not know the account, tenant, or routing path required by a specific upstream provider.
+如果你不想用 `CCS_PROXY_UPSTREAM_PREFIX`，也可以把完整路径写进 Codex 配置：
 
-The hostname matters. `localhost:8000` is the safe default because Codex App will attach its ChatGPT `Authorization` header for this host. `127.0.0.1:8000`, `localhost:8787`, and `127.0.0.1:8787` can make some remote-control UI requests arrive at the upstream without `Authorization`.
+```toml
+chatgpt_base_url = "http://localhost:8000/your-route/backend-api"
+```
 
-Then start Codex App normally. The proxy forwards HTTP and WebSocket traffic to the configured upstream.
+这两种方式二选一。不要两边都写同一段路径，否则路径会重复。
 
-## Notes
+另外，不要把 `chatgpt_base_url` 配成以 `/backend-api/codex` 结尾。Codex App 会自己追加不同业务路径，例如：
 
-- This project only relays traffic.
-- It forwards `Authorization` and other end-to-end request headers, but does not create, refresh, or validate access tokens.
-- It does not manage platform accounts, account IDs, or desktop tokens.
-- The upstream proxy must implement the required Codex and ChatGPT remote-control behavior.
+- 模型请求：`/backend-api/codex/...`
+- 远程控制：`/backend-api/wham/remote/control/...`
+- 连接器：`/backend-api/aip/connectors/...`
+- 心跳或页面探测：`/backend-api/beacons/...`
+
+如果你提前写死到 `/backend-api/codex`，其他请求会被拼错路径。
+
+## 登录头补发
+
+有些 Codex App 请求会带 `Authorization` 和 `ChatGPT-Account-Id`，有些页面探测请求可能不带。
+
+`ccs-proxy` 会记住本进程内最近一次看到的非空登录头。后续请求缺少这些头时，它会自动补上再转发给上游。
+
+这个能力只在当前进程内生效：
+
+- 不读取 `~/.codex/auth.json`
+- 不创建、不刷新、不解析 token
+- 重启 `ccs-proxy` 后缓存会清空
+- 如果看到新的 `Authorization`，但没有新的 `ChatGPT-Account-Id`，旧账号 ID 会被清掉，避免新 token 配旧账号
+
+## 常见问题
+
+### 为什么一定推荐 `localhost:8000`
+
+因为 Codex App 对哪些本地地址自动附带登录头有限制。`localhost:8000` 是最稳妥的默认值。
+
+### 这个工具会帮我登录 ChatGPT 吗
+
+不会。它只转发请求，并在进程内补发已经见过的请求头。登录、账号、token 都由 Codex App 和上游服务处理。
+
+### 上游需要做什么
+
+上游必须自己支持 Codex/ChatGPT 需要的接口路径和行为。`ccs-proxy` 只是本地中转，不实现上游业务。

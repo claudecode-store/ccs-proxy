@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::FromRequestParts;
@@ -12,6 +13,7 @@ use axum::extract::ws::WebSocket;
 use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::http::Uri;
 use axum::http::header;
@@ -22,6 +24,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::RwLock;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
@@ -32,6 +35,7 @@ use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use url::Url;
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
@@ -44,6 +48,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -56,6 +61,36 @@ pub struct ProxyConfig {
 struct AppState {
     config: ProxyConfig,
     client: Client,
+    auth_headers: Arc<AuthHeaderCache>,
+}
+
+#[derive(Default)]
+struct AuthHeaderCache {
+    inner: RwLock<CachedAuthHeaders>,
+}
+
+#[derive(Default)]
+struct CachedAuthHeaders {
+    authorization: Option<HeaderValue>,
+    chatgpt_account_id: Option<HeaderValue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthHeaderState {
+    authorization_present: bool,
+    authorization_injected: bool,
+    chatgpt_account_id_present: bool,
+    chatgpt_account_id_injected: bool,
+}
+
+impl AuthHeaderState {
+    fn authorization_effective(self) -> bool {
+        self.authorization_present || self.authorization_injected
+    }
+
+    fn chatgpt_account_id_effective(self) -> bool {
+        self.chatgpt_account_id_present || self.chatgpt_account_id_injected
+    }
 }
 
 pub async fn serve(config: ProxyConfig) -> anyhow::Result<()> {
@@ -73,6 +108,7 @@ pub async fn serve(config: ProxyConfig) -> anyhow::Result<()> {
         client: Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
+        auth_headers: Arc::new(AuthHeaderCache::default()),
     };
 
     axum::serve(listener, app(state)).await?;
@@ -95,7 +131,8 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, request: Request) -> 
     if is_websocket_upgrade(request.headers()) {
         let (mut parts, _body) = request.into_parts();
         let uri = parts.uri.clone();
-        let headers = parts.headers.clone();
+        let mut headers = parts.headers.clone();
+        let auth_header_state = state.auth_headers.apply(&mut headers).await;
         let upstream_url = match build_upstream_websocket_url(
             &state.config.upstream_base_url,
             &state.config.upstream_prefix,
@@ -130,10 +167,17 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, request: Request) -> 
         let upstream = match connect_async(upstream_request).await {
             Ok((socket, _response)) => socket,
             Err(TungsteniteError::Http(response)) => {
+                let status = response.status();
+                let body_preview = websocket_error_body_preview(response.body().as_deref());
                 let response = websocket_handshake_error_response(*response);
-                debug!(
-                    status = %response.status(),
+                warn!(
+                    status = %status,
                     upstream = %upstream_url,
+                    authorization_present = auth_header_state.authorization_effective(),
+                    authorization_injected = auth_header_state.authorization_injected,
+                    chatgpt_account_id_present = auth_header_state.chatgpt_account_id_effective(),
+                    chatgpt_account_id_injected = auth_header_state.chatgpt_account_id_injected,
+                    body = %body_preview,
                     "upstream websocket handshake returned HTTP response"
                 );
                 return response.into_response();
@@ -167,10 +211,11 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, request: Request) -> 
     match proxy_http(state, request).await {
         Ok(response) => response.into_response(),
         Err(err) => {
-            error!(error = %err, "http proxy request failed");
+            let error_chain = format_error_chain(&err);
+            error!(error = %error_chain, "http proxy request failed");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("upstream request failed: {err}\n"),
+                format!("upstream request failed: {error_chain}\n"),
             )
                 .into_response()
         }
@@ -182,6 +227,8 @@ async fn proxy_http(
     request: Request,
 ) -> anyhow::Result<axum::http::Response<Body>> {
     let (parts, body) = request.into_parts();
+    let mut headers = parts.headers.clone();
+    let auth_header_state = state.auth_headers.apply(&mut headers).await;
     let upstream_url = build_upstream_url(
         &state.config.upstream_base_url,
         &state.config.upstream_prefix,
@@ -189,15 +236,44 @@ async fn proxy_http(
     )?;
     debug!(method = %parts.method, upstream = %upstream_url, "proxying http request");
 
+    let upstream_url_for_error = upstream_url.clone();
     let mut builder = state.client.request(parts.method.clone(), upstream_url);
     builder = builder.headers(proxy_request_headers(
-        &parts.headers,
+        &headers,
         &state.config.upstream_base_url,
     )?);
-    builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    if request_should_forward_body(&parts.method, &headers) {
+        builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    }
 
-    let upstream_response = builder.send().await?;
+    let upstream_response = builder
+        .send()
+        .await
+        .with_context(|| format!("failed to send upstream request to {upstream_url_for_error}"))?;
     let status = upstream_response.status();
+    if !status.is_success() {
+        let headers = proxy_response_headers(upstream_response.headers());
+        let body = upstream_response.bytes().await.with_context(|| {
+            format!("failed to read upstream error response body from {upstream_url_for_error}")
+        })?;
+        warn!(
+            method = %parts.method,
+            status = %status,
+            upstream = %upstream_url_for_error,
+            authorization_present = auth_header_state.authorization_effective(),
+            authorization_injected = auth_header_state.authorization_injected,
+            chatgpt_account_id_present = auth_header_state.chatgpt_account_id_effective(),
+            chatgpt_account_id_injected = auth_header_state.chatgpt_account_id_injected,
+            body = %body_preview(&body),
+            "upstream http response returned non-success status"
+        );
+
+        let mut response = axum::http::Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            response = response.header(name, value);
+        }
+        return Ok(response.body(Body::from(body))?);
+    }
     let headers = proxy_response_headers(upstream_response.headers());
     let body = Body::from_stream(upstream_response.bytes_stream());
 
@@ -207,6 +283,63 @@ async fn proxy_http(
     }
 
     Ok(response.body(body)?)
+}
+
+impl AuthHeaderCache {
+    async fn apply(&self, headers: &mut HeaderMap) -> AuthHeaderState {
+        let incoming_authorization = non_empty_header(headers, header::AUTHORIZATION).cloned();
+        let incoming_chatgpt_account_id =
+            non_empty_header(headers, CHATGPT_ACCOUNT_ID_HEADER).cloned();
+        let authorization_present = incoming_authorization.is_some();
+        let chatgpt_account_id_present = incoming_chatgpt_account_id.is_some();
+
+        let mut cached = self.inner.write().await;
+        if let Some(authorization) = incoming_authorization.as_ref() {
+            let authorization_changed = cached
+                .authorization
+                .as_ref()
+                .is_some_and(|cached| cached != authorization);
+            cached.authorization = Some(authorization.clone());
+            if authorization_changed && incoming_chatgpt_account_id.is_none() {
+                cached.chatgpt_account_id = None;
+            }
+        }
+        if let Some(chatgpt_account_id) = incoming_chatgpt_account_id.as_ref() {
+            cached.chatgpt_account_id = Some(chatgpt_account_id.clone());
+        }
+
+        let mut state = AuthHeaderState {
+            authorization_present,
+            authorization_injected: false,
+            chatgpt_account_id_present,
+            chatgpt_account_id_injected: false,
+        };
+
+        if !authorization_present && let Some(authorization) = cached.authorization.as_ref() {
+            headers.insert(header::AUTHORIZATION, authorization.clone());
+            state.authorization_injected = true;
+        }
+        if !chatgpt_account_id_present
+            && let Some(chatgpt_account_id) = cached.chatgpt_account_id.as_ref()
+        {
+            headers.insert(
+                HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+                chatgpt_account_id.clone(),
+            );
+            state.chatgpt_account_id_injected = true;
+        }
+
+        state
+    }
+}
+
+fn non_empty_header<'a>(
+    headers: &'a HeaderMap,
+    name: impl axum::http::header::AsHeaderName,
+) -> Option<&'a HeaderValue> {
+    headers
+        .get(name)
+        .filter(|value| !value.as_bytes().is_empty())
 }
 
 fn websocket_handshake_error_response(
@@ -328,6 +461,27 @@ fn proxy_websocket_headers(
     Ok(result)
 }
 
+fn request_should_forward_body(method: &Method, headers: &HeaderMap) -> bool {
+    if *method == Method::GET || *method == Method::HEAD {
+        return request_has_declared_body(headers);
+    }
+    true
+}
+
+fn request_has_declared_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return true;
+    }
+
+    headers.get_all(header::CONTENT_LENGTH).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(true, |content_length| content_length > 0)
+    })
+}
+
 fn copy_end_to_end_headers(from: &HeaderMap, to: &mut HeaderMap) {
     let connection_tokens = connection_header_tokens(from);
     for (name, value) in from {
@@ -383,11 +537,7 @@ fn build_upstream_url(
     uri: &Uri,
 ) -> anyhow::Result<Url> {
     let mut url = upstream_base_url.clone();
-    let path = normalize_codex_remote_control_upstream_path(combine_paths(
-        upstream_base_url.path(),
-        upstream_prefix,
-        uri.path(),
-    ));
+    let path = combine_paths(upstream_base_url.path(), upstream_prefix, uri.path());
     url.set_path(&path);
     url.set_query(uri.query());
     Ok(url)
@@ -428,12 +578,29 @@ fn push_path_segment(segments: &mut Vec<String>, path: &str) {
     }
 }
 
-fn normalize_codex_remote_control_upstream_path(path: String) -> String {
-    path.replacen(
-        "/backend-api/codex/wham/remote/control/",
-        "/backend-api/wham/remote/control/",
-        1,
-    )
+fn format_error_chain(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn websocket_error_body_preview(body: Option<&[u8]>) -> String {
+    let Some(body) = body else {
+        return String::new();
+    };
+    body_preview(body)
+}
+
+fn body_preview(body: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 256;
+    let mut preview = String::from_utf8_lossy(&body[..body.len().min(MAX_PREVIEW_BYTES)])
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    if body.len() > MAX_PREVIEW_BYTES {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn to_tungstenite_message(message: AxumWsMessage) -> TungsteniteMessage {
@@ -496,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn build_upstream_url_normalizes_codex_wham_remote_control_alias() {
+    fn build_upstream_url_does_not_rewrite_request_path() {
         let upstream = Url::parse("https://example.com").unwrap();
         let uri: Uri =
             "/agents/codex-room/room-1/backend-api/codex/wham/remote/control/server?cursor=1"
@@ -507,7 +674,7 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://example.com/agents/codex-room/room-1/backend-api/wham/remote/control/server?cursor=1"
+            "https://example.com/agents/codex-room/room-1/backend-api/codex/wham/remote/control/server?cursor=1"
         );
     }
 
@@ -525,9 +692,7 @@ mod tests {
     fn build_upstream_websocket_url_switches_scheme() {
         let https = Url::parse("https://example.com").unwrap();
         let http = Url::parse("http://example.com").unwrap();
-        let uri: Uri = "/backend-api/codex/wham/remote/control/server"
-            .parse()
-            .unwrap();
+        let uri: Uri = "/backend-api/wham/remote/control/server".parse().unwrap();
 
         assert_eq!(
             build_upstream_websocket_url(&https, "", &uri)
@@ -593,6 +758,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_header_cache_replays_observed_headers() {
+        let cache = AuthHeaderCache::default();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-1"),
+        );
+        first_headers.insert(
+            CHATGPT_ACCOUNT_ID_HEADER,
+            HeaderValue::from_static("account-1"),
+        );
+
+        let first_state = cache.apply(&mut first_headers).await;
+
+        assert!(first_state.authorization_present);
+        assert!(!first_state.authorization_injected);
+        assert!(first_state.chatgpt_account_id_present);
+        assert!(!first_state.chatgpt_account_id_injected);
+
+        let mut second_headers = HeaderMap::new();
+        let second_state = cache.apply(&mut second_headers).await;
+
+        assert!(!second_state.authorization_present);
+        assert!(second_state.authorization_injected);
+        assert!(!second_state.chatgpt_account_id_present);
+        assert!(second_state.chatgpt_account_id_injected);
+        assert_eq!(
+            second_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer token-1"
+        );
+        assert_eq!(
+            second_headers.get(CHATGPT_ACCOUNT_ID_HEADER).unwrap(),
+            "account-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_header_cache_does_not_pair_new_authorization_with_old_account_id() {
+        let cache = AuthHeaderCache::default();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-1"),
+        );
+        first_headers.insert(
+            CHATGPT_ACCOUNT_ID_HEADER,
+            HeaderValue::from_static("account-1"),
+        );
+        cache.apply(&mut first_headers).await;
+
+        let mut changed_headers = HeaderMap::new();
+        changed_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-2"),
+        );
+        cache.apply(&mut changed_headers).await;
+
+        let mut replay_headers = HeaderMap::new();
+        let replay_state = cache.apply(&mut replay_headers).await;
+
+        assert!(replay_state.authorization_injected);
+        assert!(!replay_state.chatgpt_account_id_injected);
+        assert_eq!(
+            replay_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer token-2"
+        );
+        assert!(!replay_headers.contains_key(CHATGPT_ACCOUNT_ID_HEADER));
+    }
+
+    #[test]
+    fn body_forwarding_skips_undeclared_get_and_head_bodies() {
+        let headers = HeaderMap::new();
+        assert!(!request_should_forward_body(&Method::GET, &headers));
+        assert!(!request_should_forward_body(&Method::HEAD, &headers));
+        assert!(request_should_forward_body(&Method::POST, &headers));
+
+        let mut zero_length_headers = HeaderMap::new();
+        zero_length_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert!(!request_should_forward_body(
+            &Method::GET,
+            &zero_length_headers
+        ));
+
+        let mut nonzero_length_headers = HeaderMap::new();
+        nonzero_length_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        assert!(request_should_forward_body(
+            &Method::GET,
+            &nonzero_length_headers
+        ));
+
+        let mut transfer_encoding_headers = HeaderMap::new();
+        transfer_encoding_headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert!(request_should_forward_body(
+            &Method::GET,
+            &transfer_encoding_headers
+        ));
+    }
+
+    #[tokio::test]
     async fn healthz_is_local() {
         let state = AppState {
             config: ProxyConfig {
@@ -601,6 +868,7 @@ mod tests {
                 upstream_prefix: String::new(),
             },
             client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
         };
 
         let response = app(state)
@@ -634,6 +902,7 @@ mod tests {
                 upstream_prefix: "/api".to_string(),
             },
             client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
         };
 
         let response = app(state)
@@ -659,6 +928,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_proxy_replays_cached_auth_headers_when_request_omits_them() {
+        let upstream = Router::new().route("/api/echo", any(echo_request));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/api".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy = app(state);
+
+        let first_response = proxy
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo")
+                    .header(header::AUTHORIZATION, "Bearer token-1")
+                    .header(CHATGPT_ACCOUNT_ID_HEADER, "account-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let second_response = proxy
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let body = second_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["authorization"], "Bearer token-1");
+        assert_eq!(value["chatgpt_account_id"], "account-1");
+    }
+
+    #[tokio::test]
+    async fn http_proxy_get_without_declared_body_does_not_send_body_headers() {
+        let upstream = Router::new().route("/api/echo", any(echo_request));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/api".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo?name=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["method"], "GET");
+        assert_eq!(value["path"], "/api/echo");
+        assert_eq!(value["body"], "");
+        assert!(value["content_length"].is_null());
+        assert!(value["transfer_encoding"].is_null());
+    }
+
+    #[tokio::test]
     async fn websocket_proxy_forwards_messages_bidirectionally() {
         let upstream = Router::new().route("/up/ws", get(ws_echo));
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -674,12 +1041,61 @@ mod tests {
                 upstream_prefix: "/up".to_string(),
             },
             client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
         };
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(proxy_listener, app(state)).await.unwrap();
         });
+
+        let (mut socket, _response) = connect_async(format!("ws://{proxy_addr}/ws"))
+            .await
+            .unwrap();
+        socket
+            .send(TungsteniteMessage::Text("hello".into()))
+            .await
+            .unwrap();
+
+        let message = socket.next().await.unwrap().unwrap();
+        assert_eq!(message, TungsteniteMessage::Text("upstream:hello".into()));
+    }
+
+    #[tokio::test]
+    async fn websocket_proxy_replays_cached_auth_headers_when_request_omits_them() {
+        let upstream = Router::new()
+            .route("/up/echo", any(echo_request))
+            .route("/up/ws", get(ws_auth_echo));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/up".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app(state)).await.unwrap();
+        });
+
+        let client = Client::new();
+        let seed_response = client
+            .get(format!("http://{proxy_addr}/echo"))
+            .header(header::AUTHORIZATION, "Bearer token-1")
+            .header(CHATGPT_ACCOUNT_ID_HEADER, "account-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seed_response.status(), StatusCode::OK);
 
         let (mut socket, _response) = connect_async(format!("ws://{proxy_addr}/ws"))
             .await
@@ -709,6 +1125,7 @@ mod tests {
                 upstream_prefix: "/up".to_string(),
             },
             client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
         };
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -736,7 +1153,11 @@ mod tests {
             "path": parts.uri.path(),
             "query": parts.uri.query().unwrap_or_default(),
             "x_test": parts.headers.get("x-test").and_then(|value| value.to_str().ok()).unwrap_or_default(),
+            "authorization": parts.headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).unwrap_or_default(),
+            "chatgpt_account_id": parts.headers.get(CHATGPT_ACCOUNT_ID_HEADER).and_then(|value| value.to_str().ok()).unwrap_or_default(),
             "body": String::from_utf8_lossy(&body),
+            "content_length": parts.headers.get(header::CONTENT_LENGTH).and_then(|value| value.to_str().ok()),
+            "transfer_encoding": parts.headers.get(header::TRANSFER_ENCODING).and_then(|value| value.to_str().ok()),
         });
         Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
@@ -768,5 +1189,22 @@ mod tests {
                 }
             }
         })
+    }
+
+    async fn ws_auth_echo(headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+        let auth_ok = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer token-1");
+        let account_ok = headers
+            .get(CHATGPT_ACCOUNT_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            == Some("account-1");
+
+        if !auth_ok || !account_ok {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+
+        ws_echo(ws).await.into_response()
     }
 }
