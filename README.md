@@ -16,7 +16,13 @@ http://localhost:8000
 
 不要随便改成 `127.0.0.1` 或其他端口。部分 Codex App 版本只会给 `localhost:8000` 自动带上 ChatGPT 登录头，换掉后可能出现上游返回 `401`、`403` 或连接失败。
 
-## 下载
+## 使用步骤
+
+### 步骤一：下载或自己编译
+
+推荐直接下载发布包。只有在你想自己改代码，或发布页没有适合你系统的包时，才需要自己编译。
+
+#### 方式 A：下载发布包
 
 每次发布版本都会在 GitHub Releases 里提供 6 个二进制包：
 
@@ -29,9 +35,30 @@ http://localhost:8000
 | Windows | amd64 | `ccs-proxy-windows-amd64.zip` |
 | Windows | arm64 | `ccs-proxy-windows-arm64.zip` |
 
-下载后解压，把 `ccs-proxy` 或 `ccs-proxy.exe` 放到你习惯的位置即可。
+Linux/macOS 解压方式一样。按你下载的文件名执行即可。
 
-## 自己编译
+Linux amd64 示例：
+
+```bash
+tar -xzf ccs-proxy-linux-amd64.tar.gz
+chmod +x ccs-proxy
+```
+
+macOS arm64 示例：
+
+```bash
+tar -xzf ccs-proxy-macos-arm64.tar.gz
+chmod +x ccs-proxy
+```
+
+其他 Linux/macOS 包只需要替换 `tar -xzf` 后面的文件名。
+
+Windows 解压 `zip` 后直接使用里面的 `ccs-proxy.exe`。
+
+解压后，把 `ccs-proxy` 或 `ccs-proxy.exe` 放到你习惯的位置即可。如果不想移动文件，也可以在解压目录里直接运行。
+
+<details>
+<summary>方式 B：自己编译</summary>
 
 需要先安装 Rust。
 
@@ -58,7 +85,9 @@ cargo build --release
 cargo install --path .
 ```
 
-## 启动
+</details>
+
+### 步骤二：启动
 
 直接启动会使用默认上游：
 
@@ -88,7 +117,24 @@ $env:CCS_PROXY_UPSTREAM_BASE_URL = "https://your-proxy.example"
 | `CCS_PROXY_LISTEN` | `--listen` | `127.0.0.1:8000` | 本地监听地址 |
 | `CCS_PROXY_UPSTREAM_BASE_URL` | `--upstream-base-url` | `https://chatgpt.claudecode.store` | 上游服务地址 |
 | `CCS_PROXY_UPSTREAM_PREFIX` | `--upstream-prefix` | 空 | 转发前自动加上的路径前缀 |
-| `RUST_LOG` | 无 | `info` | 日志级别 |
+| `RUST_LOG` | 无 | `info` | 日志级别，常用值见下方 |
+
+`RUST_LOG` 常用值：
+
+| 值 | 说明 |
+| --- | --- |
+| `off` | 关闭日志 |
+| `error` | 只看错误 |
+| `warn` | 看警告和错误 |
+| `info` | 默认值，适合日常使用 |
+| `debug` | 看更详细的转发信息，排查问题时使用 |
+| `trace` | 最详细，日志很多，一般只在深入排查时使用 |
+
+也可以只打开本项目的详细日志：
+
+```bash
+RUST_LOG=ccs_proxy=debug ccs-proxy
+```
 
 示例：
 
