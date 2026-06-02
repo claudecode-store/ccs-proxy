@@ -49,6 +49,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const REMOTE_CONTROL_SERVER_PATH: &str = "/wham/remote/control/server";
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -93,6 +94,18 @@ impl AuthHeaderState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AuthHeaderPolicy {
+    ReplayMissing,
+    ReplaceAuthorizationWithCached,
+}
+
+impl AuthHeaderPolicy {
+    fn replaces_authorization(self) -> bool {
+        matches!(self, Self::ReplaceAuthorizationWithCached)
+    }
+}
+
 pub async fn serve(config: ProxyConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -132,7 +145,10 @@ async fn proxy_handler(State(state): State<Arc<AppState>>, request: Request) -> 
         let (mut parts, _body) = request.into_parts();
         let uri = parts.uri.clone();
         let mut headers = parts.headers.clone();
-        let auth_header_state = state.auth_headers.apply(&mut headers).await;
+        let auth_header_state = state
+            .auth_headers
+            .apply(&mut headers, auth_header_policy_for_uri(&uri))
+            .await;
         let upstream_url = match build_upstream_websocket_url(
             &state.config.upstream_base_url,
             &state.config.upstream_prefix,
@@ -228,7 +244,10 @@ async fn proxy_http(
 ) -> anyhow::Result<axum::http::Response<Body>> {
     let (parts, body) = request.into_parts();
     let mut headers = parts.headers.clone();
-    let auth_header_state = state.auth_headers.apply(&mut headers).await;
+    let auth_header_state = state
+        .auth_headers
+        .apply(&mut headers, auth_header_policy_for_uri(&parts.uri))
+        .await;
     let upstream_url = build_upstream_url(
         &state.config.upstream_base_url,
         &state.config.upstream_prefix,
@@ -286,7 +305,7 @@ async fn proxy_http(
 }
 
 impl AuthHeaderCache {
-    async fn apply(&self, headers: &mut HeaderMap) -> AuthHeaderState {
+    async fn apply(&self, headers: &mut HeaderMap, policy: AuthHeaderPolicy) -> AuthHeaderState {
         let incoming_authorization = non_empty_header(headers, header::AUTHORIZATION).cloned();
         let incoming_chatgpt_account_id =
             non_empty_header(headers, CHATGPT_ACCOUNT_ID_HEADER).cloned();
@@ -294,18 +313,20 @@ impl AuthHeaderCache {
         let chatgpt_account_id_present = incoming_chatgpt_account_id.is_some();
 
         let mut cached = self.inner.write().await;
-        if let Some(authorization) = incoming_authorization.as_ref() {
-            let authorization_changed = cached
-                .authorization
-                .as_ref()
-                .is_some_and(|cached| cached != authorization);
-            cached.authorization = Some(authorization.clone());
-            if authorization_changed && incoming_chatgpt_account_id.is_none() {
-                cached.chatgpt_account_id = None;
+        if !policy.replaces_authorization() {
+            if let Some(authorization) = incoming_authorization.as_ref() {
+                let authorization_changed = cached
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|cached| cached != authorization);
+                cached.authorization = Some(authorization.clone());
+                if authorization_changed && incoming_chatgpt_account_id.is_none() {
+                    cached.chatgpt_account_id = None;
+                }
             }
-        }
-        if let Some(chatgpt_account_id) = incoming_chatgpt_account_id.as_ref() {
-            cached.chatgpt_account_id = Some(chatgpt_account_id.clone());
+            if let Some(chatgpt_account_id) = incoming_chatgpt_account_id.as_ref() {
+                cached.chatgpt_account_id = Some(chatgpt_account_id.clone());
+            }
         }
 
         let mut state = AuthHeaderState {
@@ -315,7 +336,9 @@ impl AuthHeaderCache {
             chatgpt_account_id_injected: false,
         };
 
-        if !authorization_present && let Some(authorization) = cached.authorization.as_ref() {
+        if (policy.replaces_authorization() || !authorization_present)
+            && let Some(authorization) = cached.authorization.as_ref()
+        {
             headers.insert(header::AUTHORIZATION, authorization.clone());
             state.authorization_injected = true;
         }
@@ -330,6 +353,14 @@ impl AuthHeaderCache {
         }
 
         state
+    }
+}
+
+fn auth_header_policy_for_uri(uri: &Uri) -> AuthHeaderPolicy {
+    if uri.path().ends_with(REMOTE_CONTROL_SERVER_PATH) {
+        AuthHeaderPolicy::ReplaceAuthorizationWithCached
+    } else {
+        AuthHeaderPolicy::ReplayMissing
     }
 }
 
@@ -770,7 +801,9 @@ mod tests {
             HeaderValue::from_static("account-1"),
         );
 
-        let first_state = cache.apply(&mut first_headers).await;
+        let first_state = cache
+            .apply(&mut first_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
 
         assert!(first_state.authorization_present);
         assert!(!first_state.authorization_injected);
@@ -778,7 +811,9 @@ mod tests {
         assert!(!first_state.chatgpt_account_id_injected);
 
         let mut second_headers = HeaderMap::new();
-        let second_state = cache.apply(&mut second_headers).await;
+        let second_state = cache
+            .apply(&mut second_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
 
         assert!(!second_state.authorization_present);
         assert!(second_state.authorization_injected);
@@ -806,17 +841,23 @@ mod tests {
             CHATGPT_ACCOUNT_ID_HEADER,
             HeaderValue::from_static("account-1"),
         );
-        cache.apply(&mut first_headers).await;
+        cache
+            .apply(&mut first_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
 
         let mut changed_headers = HeaderMap::new();
         changed_headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer token-2"),
         );
-        cache.apply(&mut changed_headers).await;
+        cache
+            .apply(&mut changed_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
 
         let mut replay_headers = HeaderMap::new();
-        let replay_state = cache.apply(&mut replay_headers).await;
+        let replay_state = cache
+            .apply(&mut replay_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
 
         assert!(replay_state.authorization_injected);
         assert!(!replay_state.chatgpt_account_id_injected);
@@ -825,6 +866,51 @@ mod tests {
             "Bearer token-2"
         );
         assert!(!replay_headers.contains_key(CHATGPT_ACCOUNT_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn auth_header_cache_replaces_authorization_without_updating_cache() {
+        let cache = AuthHeaderCache::default();
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-1"),
+        );
+        first_headers.insert(
+            CHATGPT_ACCOUNT_ID_HEADER,
+            HeaderValue::from_static("account-1"),
+        );
+        cache
+            .apply(&mut first_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
+
+        let mut remote_control_headers = HeaderMap::new();
+        remote_control_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-2"),
+        );
+        let remote_control_state = cache
+            .apply(
+                &mut remote_control_headers,
+                AuthHeaderPolicy::ReplaceAuthorizationWithCached,
+            )
+            .await;
+
+        assert!(remote_control_state.authorization_present);
+        assert!(remote_control_state.authorization_injected);
+        assert_eq!(
+            remote_control_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer token-1"
+        );
+
+        let mut replay_headers = HeaderMap::new();
+        cache
+            .apply(&mut replay_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
+        assert_eq!(
+            replay_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer token-1"
+        );
     }
 
     #[test]
@@ -986,6 +1072,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_proxy_replaces_remote_control_authorization_with_cached_authorization() {
+        let upstream = Router::new()
+            .route("/api/echo", any(echo_request))
+            .route("/api/wham/remote/control/server", any(echo_request));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/api".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy = app(state);
+
+        let seed_response = proxy
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo")
+                    .header(header::AUTHORIZATION, "Bearer token-1")
+                    .header(CHATGPT_ACCOUNT_ID_HEADER, "account-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seed_response.status(), StatusCode::OK);
+
+        let remote_control_response = proxy
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/wham/remote/control/server")
+                    .header(header::AUTHORIZATION, "Bearer token-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(remote_control_response.status(), StatusCode::OK);
+        let body = remote_control_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["authorization"], "Bearer token-1");
+        assert_eq!(value["chatgpt_account_id"], "account-1");
+    }
+
+    #[tokio::test]
     async fn http_proxy_get_without_declared_body_does_not_send_body_headers() {
         let upstream = Router::new().route("/api/echo", any(echo_request));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1100,6 +1247,59 @@ mod tests {
         let (mut socket, _response) = connect_async(format!("ws://{proxy_addr}/ws"))
             .await
             .unwrap();
+        socket
+            .send(TungsteniteMessage::Text("hello".into()))
+            .await
+            .unwrap();
+
+        let message = socket.next().await.unwrap().unwrap();
+        assert_eq!(message, TungsteniteMessage::Text("upstream:hello".into()));
+    }
+
+    #[tokio::test]
+    async fn websocket_proxy_replaces_remote_control_authorization_with_cached_authorization() {
+        let upstream = Router::new()
+            .route("/up/echo", any(echo_request))
+            .route("/up/wham/remote/control/server", get(ws_auth_echo));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/up".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app(state)).await.unwrap();
+        });
+
+        let client = Client::new();
+        let seed_response = client
+            .get(format!("http://{proxy_addr}/echo"))
+            .header(header::AUTHORIZATION, "Bearer token-1")
+            .header(CHATGPT_ACCOUNT_ID_HEADER, "account-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seed_response.status(), StatusCode::OK);
+
+        let mut request = format!("ws://{proxy_addr}/wham/remote/control/server")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-2"),
+        );
+        let (mut socket, _response) = connect_async(request).await.unwrap();
         socket
             .send(TungsteniteMessage::Text("hello".into()))
             .await
