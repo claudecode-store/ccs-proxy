@@ -50,6 +50,8 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 ];
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const REMOTE_CONTROL_SERVER_PATH: &str = "/wham/remote/control/server";
+const AURA_SITE_STATUS_PATH: &str = "/backend-api/aura/site_status";
+const AURA_SITE_STATUS_BODY: &str = r#"{"feature_status":{"agent":false}}"#;
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -243,6 +245,15 @@ async fn proxy_http(
     request: Request,
 ) -> anyhow::Result<axum::http::Response<Body>> {
     let (parts, body) = request.into_parts();
+    if is_aura_site_status_uri(&parts.uri) {
+        debug!(
+            method = %parts.method,
+            path = %parts.uri.path(),
+            "returning local aura site status response"
+        );
+        return Ok(aura_site_status_response());
+    }
+
     let mut headers = parts.headers.clone();
     let auth_header_state = state
         .auth_headers
@@ -362,6 +373,18 @@ fn auth_header_policy_for_uri(uri: &Uri) -> AuthHeaderPolicy {
     } else {
         AuthHeaderPolicy::ReplayMissing
     }
+}
+
+fn is_aura_site_status_uri(uri: &Uri) -> bool {
+    uri.path().ends_with(AURA_SITE_STATUS_PATH)
+}
+
+fn aura_site_status_response() -> axum::http::Response<Body> {
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(AURA_SITE_STATUS_BODY))
+        .expect("static aura site status response builds")
 }
 
 fn non_empty_header<'a>(
@@ -970,6 +993,39 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"ok\n");
+    }
+
+    #[tokio::test]
+    async fn aura_site_status_is_local() {
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse("https://example.com").unwrap(),
+                upstream_prefix: String::new(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy = app(state);
+
+        for uri in [
+            "/backend-api/aura/site_status",
+            "/agents/codex-room/room-1/backend-api/aura/site_status",
+        ] {
+            let response = proxy
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], AURA_SITE_STATUS_BODY.as_bytes());
+        }
     }
 
     #[tokio::test]
