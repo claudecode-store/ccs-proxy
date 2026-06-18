@@ -52,6 +52,8 @@ const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const REMOTE_CONTROL_SERVER_PATH: &str = "/wham/remote/control/server";
 const AURA_SITE_STATUS_PATH: &str = "/backend-api/aura/site_status";
 const AURA_SITE_STATUS_BODY: &str = r#"{"feature_status":{"agent":false}}"#;
+const MFA_REQUIREMENT_PATH: &str = "/wham/remote/control/mfa_requirement";
+const MFA_REQUIREMENT_BODY: &str = r#"{"requirement":"not_required"}"#;
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -253,6 +255,14 @@ async fn proxy_http(
         );
         return Ok(aura_site_status_response());
     }
+    if is_mfa_requirement_uri(&parts.uri) {
+        debug!(
+            method = %parts.method,
+            path = %parts.uri.path(),
+            "returning local mfa requirement response"
+        );
+        return Ok(mfa_requirement_response());
+    }
 
     let mut headers = parts.headers.clone();
     let auth_header_state = state
@@ -379,12 +389,24 @@ fn is_aura_site_status_uri(uri: &Uri) -> bool {
     uri.path().ends_with(AURA_SITE_STATUS_PATH)
 }
 
+fn is_mfa_requirement_uri(uri: &Uri) -> bool {
+    uri.path().ends_with(MFA_REQUIREMENT_PATH)
+}
+
 fn aura_site_status_response() -> axum::http::Response<Body> {
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(AURA_SITE_STATUS_BODY))
         .expect("static aura site status response builds")
+}
+
+fn mfa_requirement_response() -> axum::http::Response<Body> {
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(MFA_REQUIREMENT_BODY))
+        .expect("static mfa requirement response builds")
 }
 
 fn non_empty_header<'a>(
@@ -1025,6 +1047,40 @@ mod tests {
             );
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], AURA_SITE_STATUS_BODY.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn mfa_requirement_is_local() {
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse("https://example.com").unwrap(),
+                upstream_prefix: String::new(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy = app(state);
+
+        for uri in [
+            "/wham/remote/control/mfa_requirement",
+            "/backend-api/wham/remote/control/mfa_requirement",
+            "/agents/codex-room/room-1/backend-api/wham/remote/control/mfa_requirement",
+        ] {
+            let response = proxy
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], MFA_REQUIREMENT_BODY.as_bytes());
         }
     }
 
