@@ -102,9 +102,18 @@ impl AuthHeaderState {
 enum AuthHeaderPolicy {
     ReplayMissing,
     ReplaceAuthorizationWithCached,
+    PassThrough,
 }
 
 impl AuthHeaderPolicy {
+    fn records_incoming(self) -> bool {
+        matches!(self, Self::ReplayMissing)
+    }
+
+    fn replays_cached(self) -> bool {
+        !matches!(self, Self::PassThrough)
+    }
+
     fn replaces_authorization(self) -> bool {
         matches!(self, Self::ReplaceAuthorizationWithCached)
     }
@@ -296,17 +305,32 @@ async fn proxy_http(
         let body = upstream_response.bytes().await.with_context(|| {
             format!("failed to read upstream error response body from {upstream_url_for_error}")
         })?;
-        warn!(
-            method = %parts.method,
-            status = %status,
-            upstream = %upstream_url_for_error,
-            authorization_present = auth_header_state.authorization_effective(),
-            authorization_injected = auth_header_state.authorization_injected,
-            chatgpt_account_id_present = auth_header_state.chatgpt_account_id_effective(),
-            chatgpt_account_id_injected = auth_header_state.chatgpt_account_id_injected,
-            body = %body_preview(&body),
-            "upstream http response returned non-success status"
-        );
+        let body_preview = body_preview(&body);
+        if is_expected_mcp_discovery_response(&parts.method, &parts.uri, status) {
+            debug!(
+                method = %parts.method,
+                status = %status,
+                upstream = %upstream_url_for_error,
+                authorization_present = auth_header_state.authorization_effective(),
+                authorization_injected = auth_header_state.authorization_injected,
+                chatgpt_account_id_present = auth_header_state.chatgpt_account_id_effective(),
+                chatgpt_account_id_injected = auth_header_state.chatgpt_account_id_injected,
+                body = %body_preview,
+                "upstream mcp discovery request returned expected non-success status"
+            );
+        } else {
+            warn!(
+                method = %parts.method,
+                status = %status,
+                upstream = %upstream_url_for_error,
+                authorization_present = auth_header_state.authorization_effective(),
+                authorization_injected = auth_header_state.authorization_injected,
+                chatgpt_account_id_present = auth_header_state.chatgpt_account_id_effective(),
+                chatgpt_account_id_injected = auth_header_state.chatgpt_account_id_injected,
+                body = %body_preview,
+                "upstream http response returned non-success status"
+            );
+        }
 
         let mut response = axum::http::Response::builder().status(status);
         for (name, value) in headers.iter() {
@@ -334,7 +358,7 @@ impl AuthHeaderCache {
         let chatgpt_account_id_present = incoming_chatgpt_account_id.is_some();
 
         let mut cached = self.inner.write().await;
-        if !policy.replaces_authorization() {
+        if policy.records_incoming() {
             if let Some(authorization) = incoming_authorization.as_ref() {
                 let authorization_changed = cached
                     .authorization
@@ -357,13 +381,15 @@ impl AuthHeaderCache {
             chatgpt_account_id_injected: false,
         };
 
-        if (policy.replaces_authorization() || !authorization_present)
+        if policy.replays_cached()
+            && (policy.replaces_authorization() || !authorization_present)
             && let Some(authorization) = cached.authorization.as_ref()
         {
             headers.insert(header::AUTHORIZATION, authorization.clone());
             state.authorization_injected = true;
         }
-        if !chatgpt_account_id_present
+        if policy.replays_cached()
+            && !chatgpt_account_id_present
             && let Some(chatgpt_account_id) = cached.chatgpt_account_id.as_ref()
         {
             headers.insert(
@@ -378,11 +404,39 @@ impl AuthHeaderCache {
 }
 
 fn auth_header_policy_for_uri(uri: &Uri) -> AuthHeaderPolicy {
-    if uri.path().ends_with(REMOTE_CONTROL_SERVER_PATH) {
+    if is_oauth_discovery_metadata_uri(uri) {
+        AuthHeaderPolicy::PassThrough
+    } else if uri.path().ends_with(REMOTE_CONTROL_SERVER_PATH) {
         AuthHeaderPolicy::ReplaceAuthorizationWithCached
     } else {
         AuthHeaderPolicy::ReplayMissing
     }
+}
+
+fn is_oauth_discovery_metadata_uri(uri: &Uri) -> bool {
+    let mut previous_segment = None;
+    for segment in uri.path().split('/').filter(|segment| !segment.is_empty()) {
+        if previous_segment == Some(".well-known")
+            && matches!(
+                segment,
+                "oauth-protected-resource" | "oauth-authorization-server" | "openid-configuration"
+            )
+        {
+            return true;
+        }
+        previous_segment = Some(segment);
+    }
+    false
+}
+
+fn is_expected_mcp_discovery_response(method: &Method, uri: &Uri, status: StatusCode) -> bool {
+    if *method != Method::GET {
+        return false;
+    }
+
+    let path = uri.path().trim_end_matches('/');
+    (status == StatusCode::METHOD_NOT_ALLOWED && path.ends_with("/ps/mcp"))
+        || (status == StatusCode::NOT_FOUND && is_oauth_discovery_metadata_uri(uri))
 }
 
 fn is_aura_site_status_uri(uri: &Uri) -> bool {
@@ -958,6 +1012,159 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auth_header_cache_pass_through_neither_replays_nor_records_headers() {
+        let cache = AuthHeaderCache::default();
+        let mut seed_headers = HeaderMap::new();
+        seed_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token-1"),
+        );
+        seed_headers.insert(
+            CHATGPT_ACCOUNT_ID_HEADER,
+            HeaderValue::from_static("account-1"),
+        );
+        cache
+            .apply(&mut seed_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
+
+        let mut empty_metadata_headers = HeaderMap::new();
+        let empty_metadata_state = cache
+            .apply(&mut empty_metadata_headers, AuthHeaderPolicy::PassThrough)
+            .await;
+        assert!(!empty_metadata_state.authorization_injected);
+        assert!(!empty_metadata_state.chatgpt_account_id_injected);
+        assert!(!empty_metadata_headers.contains_key(header::AUTHORIZATION));
+        assert!(!empty_metadata_headers.contains_key(CHATGPT_ACCOUNT_ID_HEADER));
+
+        let mut explicit_metadata_headers = HeaderMap::new();
+        explicit_metadata_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer metadata-token"),
+        );
+        explicit_metadata_headers.insert(
+            CHATGPT_ACCOUNT_ID_HEADER,
+            HeaderValue::from_static("metadata-account"),
+        );
+        let explicit_metadata_state = cache
+            .apply(
+                &mut explicit_metadata_headers,
+                AuthHeaderPolicy::PassThrough,
+            )
+            .await;
+        assert!(explicit_metadata_state.authorization_present);
+        assert!(!explicit_metadata_state.authorization_injected);
+        assert!(explicit_metadata_state.chatgpt_account_id_present);
+        assert!(!explicit_metadata_state.chatgpt_account_id_injected);
+        assert_eq!(
+            explicit_metadata_headers
+                .get(header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer metadata-token"
+        );
+        assert_eq!(
+            explicit_metadata_headers
+                .get(CHATGPT_ACCOUNT_ID_HEADER)
+                .unwrap(),
+            "metadata-account"
+        );
+
+        let mut replay_headers = HeaderMap::new();
+        cache
+            .apply(&mut replay_headers, AuthHeaderPolicy::ReplayMissing)
+            .await;
+        assert_eq!(
+            replay_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer token-1"
+        );
+        assert_eq!(
+            replay_headers.get(CHATGPT_ACCOUNT_ID_HEADER).unwrap(),
+            "account-1"
+        );
+    }
+
+    #[test]
+    fn oauth_discovery_metadata_paths_use_pass_through_auth() {
+        for path in [
+            "/.well-known/oauth-protected-resource/agents/codex-room/room-1/backend-api/ps/mcp",
+            "/agents/codex-room/room-1/backend-api/ps/mcp/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server/agents/codex-room/room-1/backend-api/ps/mcp",
+            "/.well-known/openid-configuration/agents/codex-room/room-1/backend-api/ps/mcp",
+            "/agents/codex-room/room-1/backend-api/ps/mcp/.well-known/openid-configuration",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(is_oauth_discovery_metadata_uri(&uri), "path: {path}");
+            assert!(matches!(
+                auth_header_policy_for_uri(&uri),
+                AuthHeaderPolicy::PassThrough
+            ));
+        }
+
+        for path in [
+            "/backend-api/ps/mcp",
+            "/.well-known/change-password",
+            "/backend-api/oauth-protected-resource",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert!(!is_oauth_discovery_metadata_uri(&uri), "path: {path}");
+            assert!(matches!(
+                auth_header_policy_for_uri(&uri),
+                AuthHeaderPolicy::ReplayMissing
+            ));
+        }
+    }
+
+    #[test]
+    fn expected_mcp_discovery_failures_are_narrowly_classified() {
+        let mcp_uri: Uri = "/agents/codex-room/room-1/backend-api/ps/mcp?cursor=1"
+            .parse()
+            .unwrap();
+        let metadata_uri: Uri =
+            "/.well-known/oauth-protected-resource/agents/codex-room/room-1/backend-api/ps/mcp"
+                .parse()
+                .unwrap();
+        let unrelated_uri: Uri = "/backend-api/codex/responses".parse().unwrap();
+
+        assert!(is_expected_mcp_discovery_response(
+            &Method::GET,
+            &mcp_uri,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ));
+        assert!(is_expected_mcp_discovery_response(
+            &Method::GET,
+            &metadata_uri,
+            StatusCode::NOT_FOUND,
+        ));
+
+        assert!(!is_expected_mcp_discovery_response(
+            &Method::POST,
+            &mcp_uri,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ));
+        assert!(!is_expected_mcp_discovery_response(
+            &Method::GET,
+            &mcp_uri,
+            StatusCode::NOT_FOUND,
+        ));
+        assert!(!is_expected_mcp_discovery_response(
+            &Method::POST,
+            &metadata_uri,
+            StatusCode::NOT_FOUND,
+        ));
+        assert!(!is_expected_mcp_discovery_response(
+            &Method::GET,
+            &metadata_uri,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+        assert!(!is_expected_mcp_discovery_response(
+            &Method::GET,
+            &unrelated_uri,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ));
+    }
+
     #[test]
     fn body_forwarding_skips_undeclared_get_and_head_bodies() {
         let headers = HeaderMap::new();
@@ -1173,6 +1380,117 @@ mod tests {
 
         assert_eq!(second_response.status(), StatusCode::OK);
         let body = second_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["authorization"], "Bearer token-1");
+        assert_eq!(value["chatgpt_account_id"], "account-1");
+    }
+
+    #[tokio::test]
+    async fn http_proxy_forwards_oauth_metadata_without_replaying_cached_auth_headers() {
+        const DOWNSTREAM_METADATA_PATH: &str =
+            "/.well-known/oauth-protected-resource/agents/codex-room/room-1/backend-api/ps/mcp";
+        const UPSTREAM_METADATA_PATH: &str =
+            "/api/.well-known/oauth-protected-resource/agents/codex-room/room-1/backend-api/ps/mcp";
+
+        let upstream = Router::new()
+            .route("/api/echo", any(echo_request))
+            .route(UPSTREAM_METADATA_PATH, any(echo_request));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: "/api".to_string(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+        let proxy = app(state);
+
+        let seed_response = proxy
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo")
+                    .header(header::AUTHORIZATION, "Bearer token-1")
+                    .header(CHATGPT_ACCOUNT_ID_HEADER, "account-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seed_response.status(), StatusCode::OK);
+
+        let metadata_response = proxy
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(DOWNSTREAM_METADATA_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata_response.status(), StatusCode::OK);
+        let body = metadata_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["path"], UPSTREAM_METADATA_PATH);
+        assert_eq!(value["authorization"], "");
+        assert_eq!(value["chatgpt_account_id"], "");
+
+        let explicit_metadata_response = proxy
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(DOWNSTREAM_METADATA_PATH)
+                    .header(header::AUTHORIZATION, "Bearer metadata-token")
+                    .header(CHATGPT_ACCOUNT_ID_HEADER, "metadata-account")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit_metadata_response.status(), StatusCode::OK);
+        let body = explicit_metadata_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["authorization"], "Bearer metadata-token");
+        assert_eq!(value["chatgpt_account_id"], "metadata-account");
+
+        let replay_response = proxy
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let body = replay_response
             .into_body()
             .collect()
             .await
