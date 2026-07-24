@@ -49,6 +49,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const DEVICECHECK_COOKIE_NAME: &str = "_devicecheck";
 const REMOTE_CONTROL_SERVER_PATH: &str = "/wham/remote/control/server";
 const AURA_SITE_STATUS_PATH: &str = "/backend-api/aura/site_status";
 const AURA_SITE_STATUS_BODY: &str = r#"{"feature_status":{"agent":false}}"#;
@@ -301,7 +302,7 @@ async fn proxy_http(
         .with_context(|| format!("failed to send upstream request to {upstream_url_for_error}"))?;
     let status = upstream_response.status();
     if !status.is_success() {
-        let headers = proxy_response_headers(upstream_response.headers());
+        let headers = proxy_http_response_headers(upstream_response.headers(), &parts.uri);
         let body = upstream_response.bytes().await.with_context(|| {
             format!("failed to read upstream error response body from {upstream_url_for_error}")
         })?;
@@ -338,7 +339,7 @@ async fn proxy_http(
         }
         return Ok(response.body(Body::from(body))?);
     }
-    let headers = proxy_response_headers(upstream_response.headers());
+    let headers = proxy_http_response_headers(upstream_response.headers(), &parts.uri);
     let body = Body::from_stream(upstream_response.bytes_stream());
 
     let mut response = axum::http::Response::builder().status(status);
@@ -574,6 +575,92 @@ fn proxy_response_headers(headers: &HeaderMap) -> HeaderMap {
     let mut result = HeaderMap::new();
     copy_end_to_end_headers(headers, &mut result);
     result
+}
+
+fn proxy_http_response_headers(headers: &HeaderMap, uri: &Uri) -> HeaderMap {
+    let mut result = proxy_response_headers(headers);
+    let Some(cookie_path) = devicecheck_cookie_path(uri.path()) else {
+        return result;
+    };
+
+    let rewritten_cookie_count = rewrite_devicecheck_set_cookie_headers(&mut result, cookie_path);
+    if rewritten_cookie_count > 0 {
+        debug!(
+            path = uri.path(),
+            cookie_path, rewritten_cookie_count, "rewrote DeviceCheck cookie for local HTTP origin"
+        );
+    }
+    result
+}
+
+fn devicecheck_cookie_path(request_path: &str) -> Option<&str> {
+    let request_path = request_path.strip_suffix('/').unwrap_or(request_path);
+    if request_path == "/devicecheck" {
+        return Some("/");
+    }
+
+    let cookie_path = request_path.strip_suffix("/devicecheck")?;
+    cookie_path.ends_with("/backend-api").then_some(cookie_path)
+}
+
+fn rewrite_devicecheck_set_cookie_headers(headers: &mut HeaderMap, cookie_path: &str) -> usize {
+    let cookies = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if cookies.is_empty() {
+        return 0;
+    }
+
+    headers.remove(header::SET_COOKIE);
+    let mut rewritten_cookie_count = 0;
+    for cookie in cookies {
+        let cookie = match rewrite_devicecheck_set_cookie(&cookie, cookie_path) {
+            Some(rewritten) => {
+                rewritten_cookie_count += 1;
+                rewritten
+            }
+            None => cookie,
+        };
+        headers.append(header::SET_COOKIE, cookie);
+    }
+    rewritten_cookie_count
+}
+
+fn rewrite_devicecheck_set_cookie(cookie: &HeaderValue, cookie_path: &str) -> Option<HeaderValue> {
+    let raw_cookie = cookie.to_str().ok()?;
+    let mut segments = raw_cookie.split(';');
+    let name_value = segments.next()?.trim();
+    let (name, _) = name_value.split_once('=')?;
+    if name.trim() != DEVICECHECK_COOKIE_NAME {
+        return None;
+    }
+
+    let mut rewritten = vec![name_value.to_string()];
+    for segment in segments {
+        let attribute = segment.trim();
+        if attribute.is_empty() {
+            continue;
+        }
+        let attribute_name = attribute
+            .split_once('=')
+            .map_or(attribute, |(name, _)| name)
+            .trim();
+        if ["domain", "path", "secure", "samesite", "partitioned"]
+            .iter()
+            .any(|replaced| attribute_name.eq_ignore_ascii_case(replaced))
+        {
+            continue;
+        }
+        rewritten.push(attribute.to_string());
+    }
+    rewritten.push(format!("Path={cookie_path}"));
+    rewritten.push("SameSite=Lax".to_string());
+
+    let mut rewritten = HeaderValue::from_str(&rewritten.join("; ")).ok()?;
+    rewritten.set_sensitive(cookie.is_sensitive());
+    Some(rewritten)
 }
 
 fn proxy_websocket_headers(
@@ -885,6 +972,17 @@ mod tests {
         assert_eq!(result.get("x-keep-me").unwrap(), "keep");
         assert!(!result.contains_key(header::CONNECTION));
         assert!(!result.contains_key(header::UPGRADE));
+    }
+
+    #[test]
+    fn devicecheck_cookie_path_matches_supported_proxy_layouts() {
+        assert_eq!(devicecheck_cookie_path("/devicecheck"), Some("/"));
+        assert_eq!(
+            devicecheck_cookie_path("/agents/codex-room/room-1/backend-api/devicecheck"),
+            Some("/agents/codex-room/room-1/backend-api")
+        );
+        assert_eq!(devicecheck_cookie_path("/backend-api/settings/user"), None);
+        assert_eq!(devicecheck_cookie_path("/other/devicecheck"), None);
     }
 
     #[tokio::test]
@@ -1330,6 +1428,54 @@ mod tests {
         assert_eq!(value["query"], "name=codex");
         assert_eq!(value["x_test"], "yes");
         assert_eq!(value["body"], "hello");
+    }
+
+    #[tokio::test]
+    async fn http_proxy_rewrites_devicecheck_cookie_for_local_origin() {
+        const DEVICECHECK_PATH: &str = "/agents/codex-room/room-1/backend-api/devicecheck";
+        let upstream = Router::new().route(DEVICECHECK_PATH, any(devicecheck_response));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let state = AppState {
+            config: ProxyConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: String::new(),
+            },
+            client: Client::new(),
+            auth_headers: Arc::new(AuthHeaderCache::default()),
+        };
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(DEVICECHECK_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cookies,
+            vec![
+                "_devicecheck=token; HttpOnly; Max-Age=600; \
+                 Path=/agents/codex-room/room-1/backend-api; SameSite=Lax",
+                "other=value; Domain=.chatgpt.com; Path=/backend-api; Secure; SameSite=None",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1793,6 +1939,24 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(payload.to_string()))
             .unwrap()
+    }
+
+    async fn devicecheck_response() -> Response {
+        let mut response = Response::new(Body::empty());
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "_devicecheck=token; Domain=.chatgpt.com; Path=/backend-api; \
+                 Secure; HttpOnly; SameSite=None; Partitioned; Max-Age=600",
+            ),
+        );
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "other=value; Domain=.chatgpt.com; Path=/backend-api; Secure; SameSite=None",
+            ),
+        );
+        response
     }
 
     async fn ws_echo(ws: WebSocketUpgrade) -> impl IntoResponse {
