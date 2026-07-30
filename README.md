@@ -28,14 +28,14 @@ http://localhost:8000
 
 [https://github.com/claudecode-store/ccs-proxy/releases](https://github.com/claudecode-store/ccs-proxy/releases)
 
-| 系统 | 架构 | 文件 |
-| --- | --- | --- |
-| Linux | amd64 | `ccs-proxy-linux-amd64.tar.gz` |
-| Linux | arm64 | `ccs-proxy-linux-arm64.tar.gz` |
-| macOS | amd64 | `ccs-proxy-macos-amd64.tar.gz` |
-| macOS | arm64 | `ccs-proxy-macos-arm64.tar.gz` |
-| Windows | amd64 | `ccs-proxy-windows-amd64.zip` |
-| Windows | arm64 | `ccs-proxy-windows-arm64.zip` |
+| 系统    | 架构  | 文件                           |
+| ------- | ----- | ------------------------------ |
+| Linux   | amd64 | `ccs-proxy-linux-amd64.tar.gz` |
+| Linux   | arm64 | `ccs-proxy-linux-arm64.tar.gz` |
+| macOS   | amd64 | `ccs-proxy-macos-amd64.tar.gz` |
+| macOS   | arm64 | `ccs-proxy-macos-arm64.tar.gz` |
+| Windows | amd64 | `ccs-proxy-windows-amd64.zip`  |
+| Windows | arm64 | `ccs-proxy-windows-arm64.zip`  |
 
 Linux/macOS 解压方式一样。按你下载的文件名执行即可。
 
@@ -114,22 +114,22 @@ $env:CCS_PROXY_UPSTREAM_BASE_URL = "https://your-proxy.example"
 
 环境变量和命令行参数都支持。两者同时存在时，命令行参数优先。
 
-| 环境变量 | 命令行参数 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `CCS_PROXY_LISTEN` | `--listen` | `127.0.0.1:8000` | 本地监听地址 |
-| `CCS_PROXY_UPSTREAM_BASE_URL` | `--upstream-base-url` | `https://chatgpt.claudecode.store` | 上游服务地址 |
-| `CCS_PROXY_UPSTREAM_PREFIX` | `--upstream-prefix` | 空 | 转发前自动加上的路径前缀 |
-| `RUST_LOG` | 无 | `info` | 日志级别，常用值见下方 |
+| 环境变量                      | 命令行参数            | 默认值                         | 说明                     |
+| ----------------------------- | --------------------- | ------------------------------ | ------------------------ |
+| `CCS_PROXY_LISTEN`            | `--listen`            | `127.0.0.1:8000`               | 本地监听地址             |
+| `CCS_PROXY_UPSTREAM_BASE_URL` | `--upstream-base-url` | `https://api.claudecode.store` | 上游服务地址             |
+| `CCS_PROXY_UPSTREAM_PREFIX`   | `--upstream-prefix`   | 空                             | 转发前自动加上的路径前缀 |
+| `RUST_LOG`                    | 无                    | `info`                         | 日志级别，常用值见下方   |
 
 `RUST_LOG` 常用值：
 
-| 值 | 说明 |
-| --- | --- |
-| `off` | 关闭日志 |
-| `error` | 只看错误 |
-| `warn` | 看警告和错误 |
-| `info` | 默认值，适合日常使用 |
-| `debug` | 看更详细的转发信息，排查问题时使用 |
+| 值      | 说明                                     |
+| ------- | ---------------------------------------- |
+| `off`   | 关闭日志                                 |
+| `error` | 只看错误                                 |
+| `warn`  | 看警告和错误                             |
+| `info`  | 默认值，适合日常使用                     |
+| `debug` | 看更详细的转发信息，排查问题时使用       |
 | `trace` | 最详细，日志很多，一般只在深入排查时使用 |
 
 也可以只打开本项目的详细日志：

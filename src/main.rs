@@ -7,7 +7,7 @@ use url::Url;
 mod proxy;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8000";
-const DEFAULT_UPSTREAM_BASE_URL: &str = "https://chatgpt.claudecode.store";
+const DEFAULT_UPSTREAM_BASE_URL: &str = "https://api.claudecode.store";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
