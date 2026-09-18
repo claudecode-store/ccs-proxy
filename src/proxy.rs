@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -57,7 +56,6 @@ const MFA_REQUIREMENT_BODY: &str = r#"{"requirement":"not_required"}"#;
 
 #[derive(Clone)]
 pub struct ProxyConfig {
-    pub listen: SocketAddr,
     pub upstream_base_url: Url,
     pub upstream_prefix: String,
 }
@@ -119,11 +117,15 @@ impl AuthHeaderPolicy {
     }
 }
 
-pub async fn serve(config: ProxyConfig) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(config.listen).await?;
+pub(crate) async fn serve_listener(
+    config: ProxyConfig,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    listener: TcpListener,
+) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     info!(
         listen = %local_addr,
+        scheme = if tls.is_some() { "https" } else { "http" },
         upstream = %config.upstream_base_url,
         upstream_prefix = %config.upstream_prefix,
         "ccs-proxy listening"
@@ -137,7 +139,13 @@ pub async fn serve(config: ProxyConfig) -> anyhow::Result<()> {
         auth_headers: Arc::new(AuthHeaderCache::default()),
     };
 
-    axum::serve(listener, app(state)).await?;
+    if let Some(tls) = tls {
+        axum_server::from_tcp_rustls(listener.into_std()?, tls)?
+            .serve(app(state).into_make_service())
+            .await?;
+    } else {
+        axum::serve(listener, app(state)).await?;
+    }
     Ok(())
 }
 
@@ -1270,10 +1278,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_listener_verifies_certificates_and_proxies_https_and_wss() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            certified.cert.pem().into_bytes(),
+            certified.signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route(
+                        "/agents/codex-room/test/backend-api/codex/echo",
+                        any(echo_request),
+                    )
+                    .route(
+                        "/agents/codex-room/test/backend-api/codex/ws",
+                        get(ws_cookie_echo),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_listener(
+            ProxyConfig {
+                upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
+                upstream_prefix: String::new(),
+            },
+            Some(tls),
+            listener,
+        ));
+        let url = format!(
+            "https://localhost:{}/agents/codex-room/test/backend-api/codex/echo?test=tls",
+            addr.port()
+        );
+        let untrusted = Client::builder().no_proxy().build().unwrap();
+        assert!(untrusted.get(&url).send().await.is_err());
+        let trusted = Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_der(&cert).unwrap())
+            .build()
+            .unwrap();
+        let response = trusted.post(&url).body("tls body").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            value["path"],
+            "/agents/codex-room/test/backend-api/codex/echo"
+        );
+        assert_eq!(value["body"], "tls body");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let (mut socket, response) = tokio_tungstenite::connect_async_tls_with_config(
+            format!(
+                "wss://localhost:{}/agents/codex-room/test/backend-api/codex/ws",
+                addr.port()
+            ),
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_tls))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        socket
+            .send(TungsteniteMessage::Text("tls".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            TungsteniteMessage::Text("upstream:tls".into())
+        );
+        socket.close(None).await.unwrap();
+        server.abort();
+        upstream.abort();
+    }
+
+    #[tokio::test]
     async fn healthz_is_local() {
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse("https://example.com").unwrap(),
                 upstream_prefix: String::new(),
             },
@@ -1300,7 +1399,6 @@ mod tests {
     async fn aura_site_status_is_local() {
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse("https://example.com").unwrap(),
                 upstream_prefix: String::new(),
             },
@@ -1333,7 +1431,6 @@ mod tests {
     async fn mfa_requirement_is_local() {
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse("https://example.com").unwrap(),
                 upstream_prefix: String::new(),
             },
@@ -1374,7 +1471,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/api".to_string(),
             },
@@ -1416,7 +1512,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: String::new(),
             },
@@ -1463,7 +1558,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/api".to_string(),
             },
@@ -1528,7 +1622,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/api".to_string(),
             },
@@ -1634,7 +1727,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/api".to_string(),
             },
@@ -1693,7 +1785,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/api".to_string(),
             },
@@ -1733,7 +1824,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/up".to_string(),
             },
@@ -1778,7 +1868,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/up".to_string(),
             },
@@ -1826,7 +1915,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/up".to_string(),
             },
@@ -1877,7 +1965,6 @@ mod tests {
 
         let state = AppState {
             config: ProxyConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
                 upstream_base_url: Url::parse(&format!("http://{upstream_addr}")).unwrap(),
                 upstream_prefix: "/up".to_string(),
             },

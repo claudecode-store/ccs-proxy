@@ -2,16 +2,16 @@
 
 `ccs-proxy` 是一个本地转发工具。
 
-简单说：Codex App 只能稳定地把登录信息带到 `http://localhost:8000`，但你真正要访问的服务可能在别的地址。这个工具就在中间转一下，把 Codex App 发到本机的 HTTP 和 WebSocket 请求，转发到你配置的上游服务。
+本地入口默认使用 HTTPS/WSS，将请求转发到配置的 HTTP/HTTPS 上游服务。TLS 直接由 `ccs-proxy` 提供，不需要 Caddy 等额外服务。新版 Codex App 的工作区路由要求 HTTPS，请使用下方 TLS 配置。
 
 ## 什么时候需要它
 
 你需要让 Codex App 访问一个自定义的 ChatGPT/Codex 上游服务时，可以用它。
 
-推荐在 Codex App 里使用：
+默认使用：
 
 ```text
-http://localhost:8000
+https://localhost:8000
 ```
 
 不要随便改成 `127.0.0.1` 或其他端口。部分 Codex App 版本只会给 `localhost:8000` 自动带上 ChatGPT 登录头，换掉后可能出现上游返回 `401`、`403` 或连接失败。
@@ -158,46 +158,90 @@ ccs-proxy \
 例如：
 
 ```text
-http://localhost:8000/wham/remote/control/server
+https://localhost:8000/wham/remote/control/server
 -> https://your-proxy.example/your-route/backend-api/wham/remote/control/server
 ```
 
 `ccs-proxy` 不会猜测、改写业务路径。如果 Codex App 请求的是 `/backend-api/codex/beacons/home`，上游收到的也是这个路径。路径是否正确，应由你的上游服务或 Codex 配置决定。
 
-## Codex App 怎么配
+## 自动 HTTPS / WSS（macOS / Linux / Windows）
 
-推荐方式是把上游固定前缀放到 `CCS_PROXY_UPSTREAM_PREFIX`，然后 Codex App 只配本地地址。
-
-启动代理：
+直接运行：
 
 ```bash
-CCS_PROXY_UPSTREAM_BASE_URL=https://your-proxy.example \
-CCS_PROXY_UPSTREAM_PREFIX=/your-route/backend-api \
 ccs-proxy
 ```
 
-然后在 `~/.codex/config.toml` 中配置：
+默认监听 `https://localhost:8000`，无需额外代理服务或手动运行证书生成命令。启动流程：
+
+1. 先检查监听端口是否可用；被占用则报错退出，不弹证书授权。
+2. 在用户证书目录检查本地 CA、服务端证书和私钥，不存在则生成。macOS/Linux 使用 `$XDG_CONFIG_HOME/ccs-proxy/tls` 或 `~/.config/ccs-proxy/tls`；Windows 使用 `%LOCALAPPDATA%\ccs-proxy\tls`。
+3. 检查证书签名、`localhost` 域名、有效期和私钥匹配；服务端证书临近过期（30 天内）时复用 CA 重新签发。CA 临近过期则更新，并重新检查系统信任。
+4. 按当前系统检查证书信任。未信任时打印用途和证书位置，发起授权；桌面弹窗或终端提示因平台而异。
+5. 授权后重新验证信任，成功才开始提供 HTTPS/WSS。取消或验证失败则停止启动，不会偷偷降级为 HTTP。
+
+CA 有效期 10 年，服务端证书有效期 365 天。私钥受用户目录权限保护（Unix 文件权限 600；Windows 专用目录 ACL 仅允许当前用户完全控制）。后续启动会复用有效证书和已有信任，不重复请求授权。CA 文件不完整或私钥不匹配会明确报错，不静默覆盖已有 CA。
+
+| 平台 | 信任与授权方式 |
+| --- | --- |
+| macOS | 使用 `security` 验证证书链，系统授权后安装到用户登录钥匙串。 |
+| Windows | 用 Windows 证书链验证，确认弹窗后安装到 `CurrentUser\Root`，不修改全机证书库；使用系统 Windows PowerShell。 |
+| Linux | OpenSSL 验证系统信任；优先用桌面 `pkexec` 授权，否则终端 `sudo`；root 可直接安装。 |
+
+Linux 支持 `update-ca-certificates`（Debian/Ubuntu、Alpine、openSUSE）和 `update-ca-trust`（Fedora/RHEL、Arch）对应的信任目录，需安装 `openssl`、`ca-certificates`。若已有 Chromium/Electron NSS 数据库（`~/.pki/nssdb` 或 `~/.local/share/pki/nssdb`），还会检查并安装该库的 CA 信任，需提供 `certutil`（Debian/Ubuntu 的 `libnss3-tools`、Fedora/RHEL 的 `nss-tools`）。缺少工具会明确报错，不会跳过验证或擅自安装软件包。无桌面会话时使用终端授权；无交互服务首次运行应预先完成信任配置。
+
+Linux 安装的是系统 CA，Windows/macOS 默认安装用户 CA；授权后都会再次验证。某些使用独立信任库的应用仍需单独配置，不能仅凭系统信任就保证所有应用均可用。
+
+自动流程不修改 Codex 配置、账户凭据、环境变量或请求路径。
+
+### 保留当前完整 URL 配置方式
+
+**房间路径仍写在 App 的 URL 中，不需要迁移到 `--upstream-prefix`。只将原 URL 的 `http` 改为 `https`。** 例如你原来使用 `/agents/codex-room/ROOM_ID/backend-api/codex`：
 
 ```toml
-chatgpt_base_url = "http://localhost:8000"
+chatgpt_base_url = "https://localhost:8000/agents/codex-room/ROOM_ID/backend-api/codex"
+
+# 保留当前 model_providers 表，只修改原 base_url 的协议：
+# base_url = "https://localhost:8000/agents/codex-room/ROOM_ID/backend-api/codex"
 ```
 
-如果你不想用 `CCS_PROXY_UPSTREAM_PREFIX`，也可以把完整路径写进 Codex 配置：
+桌面环境变量同样保留完整路径：
 
-```toml
-chatgpt_base_url = "http://localhost:8000/your-route/backend-api"
+```bash
+launchctl setenv CODEX_API_BASE_URL "https://localhost:8000/agents/codex-room/ROOM_ID/backend-api/codex"
 ```
 
-这两种方式二选一。不要两边都写同一段路径，否则路径会重复。
+代理按收到的路径原样转发：
 
-另外，不要把 `chatgpt_base_url` 配成以 `/backend-api/codex` 结尾。Codex App 会自己追加不同业务路径，例如：
+```text
+https://localhost:8000/agents/codex-room/ROOM_ID/backend-api/codex/wham/accounts/check
+→ https://api.claudecode.store/agents/codex-room/ROOM_ID/backend-api/codex/wham/accounts/check
+```
 
-- 模型请求：`/backend-api/codex/...`
-- 远程控制：`/backend-api/wham/remote/control/...`
-- 连接器：`/backend-api/aip/connectors/...`
-- 心跳或页面探测：`/backend-api/beacons/...`
+TLS 就绪不代表 App 登录全部通过。新版 App 的工作区路由可能仅保留 origin 而丢弃完整路径；本代理不会自动猜测或补回房间路径。遇到此类请求应结合实际日志诊断。账户 ID 一致性及 Codex 子进程的 CA 信任也需要分别验证。
 
-如果你提前写死到 `/backend-api/codex`，其他请求会被拼错路径。
+如果 Codex Rust 子进程没有读取系统信任，可以在启动 App 前显式配置 `SSL_CERT_FILE` 指向上述 `ca.pem`；程序不会自动设置该环境变量。
+
+### 自行提供证书
+
+高级用法仍支持 PEM 证书链和私钥（两个参数必须同时提供）。此模式不生成证书、不修改系统信任，证书信任由使用者管理：
+
+```bash
+ccs-proxy --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+```
+
+| 参数 | 环境变量 | 用途 |
+| --- | --- | --- |
+| `--tls-cert` | `CCS_PROXY_TLS_CERT` | 服务端证书链 |
+| `--tls-key` | `CCS_PROXY_TLS_KEY` | 服务端私钥 |
+
+验证本地监听：
+
+```bash
+curl https://localhost:8000/healthz
+```
+
+`healthz` 只验证本地 HTTPS，完整登录仍需 App 的 `account/read` 和实际业务请求成功。
 
 ## 登录头补发
 
